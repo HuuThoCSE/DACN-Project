@@ -33,10 +33,11 @@ def download_from_hdfs(hdfs_path, local_path):
         try:
             with open(local_path, "wb") as f:
                 while True:
-                    data = input_stream.read(4096)
-                    if not data:
+                    # Đọc từng khối dữ liệu từ input stream
+                    data = input_stream.read(4096)  # 4096 bytes per read
+                    if data == -1:
                         break
-                    f.write(bytearray(data))
+                    f.write(bytearray([data]))
             print(f"Downloaded {hdfs_path} to {local_path}")
         finally:
             input_stream.close()
