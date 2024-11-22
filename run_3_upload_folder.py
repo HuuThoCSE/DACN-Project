@@ -11,7 +11,7 @@ spark = SparkSession.builder \
 # Đường dẫn cục bộ đến thư mục chứa ảnh
 local_dir = "/home/fit/square_pick-2/all_images"
 # Thư mục đích trên HDFS
-hdfs_dir = "/user/fit/all_images"
+hdfs_dir = "/user/fit"
 
 # Hàm để ghi từng file hoặc thư mục lên HDFS (chạy trên driver)
 def save_to_hdfs(local_path, hdfs_path):
