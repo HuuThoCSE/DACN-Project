@@ -26,18 +26,24 @@ os.makedirs(temp_local_dir, exist_ok=True)
 
 # Hàm tải file từ HDFS về cục bộ
 def download_from_hdfs(hdfs_path, local_path):
+    # Lấy FileSystem từ SparkSession
     hdfs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
     hdfs_file_path = spark._jvm.org.apache.hadoop.fs.Path(hdfs_path)
+
     if hdfs.exists(hdfs_file_path):
+        # Mở InputStream để đọc từ HDFS
         input_stream = hdfs.open(hdfs_file_path)
         try:
+            # Đọc toàn bộ nội dung từ InputStream và ghi vào file cục bộ
             with open(local_path, "wb") as f:
-                while True:
-                    # Đọc từng khối dữ liệu từ input stream
-                    data = input_stream.read(4096)  # 4096 bytes per read
-                    if data == -1:
-                        break
-                    f.write(bytearray([data]))
+                # Sử dụng DataInputStream để đọc một cách đầy đủ
+                data_input_stream = spark._jvm.java.io.DataInputStream(input_stream)
+                buffer = bytearray()
+                b = data_input_stream.read()
+                while b != -1:
+                    buffer.append(b)
+                    b = data_input_stream.read()
+                f.write(buffer)
             print(f"Downloaded {hdfs_path} to {local_path}")
         finally:
             input_stream.close()
