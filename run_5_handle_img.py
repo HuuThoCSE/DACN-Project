@@ -30,10 +30,16 @@ def download_from_hdfs(hdfs_path, local_path):
     hdfs_file_path = spark._jvm.org.apache.hadoop.fs.Path(hdfs_path)
     if hdfs.exists(hdfs_file_path):
         input_stream = hdfs.open(hdfs_file_path)
-        with open(local_path, "wb") as f:
-            f.write(bytearray(input_stream.read()))
-        input_stream.close()
-        print(f"Downloaded {hdfs_path} to {local_path}")
+        try:
+            with open(local_path, "wb") as f:
+                while True:
+                    data = input_stream.read(4096)
+                    if not data:
+                        break
+                    f.write(bytearray(data))
+            print(f"Downloaded {hdfs_path} to {local_path}")
+        finally:
+            input_stream.close()
 
 # Hàm upload file lên HDFS
 def upload_to_hdfs(local_path, hdfs_path):
