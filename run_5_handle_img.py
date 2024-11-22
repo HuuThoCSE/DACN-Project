@@ -5,8 +5,7 @@ from pyspark.ml.regression import LinearRegression
 from PIL import Image, UnidentifiedImageError
 import os
 import io
-import time
-import matplotlib.pyplot as plt
+import shutil
 
 # Khởi tạo SparkSession với YARN
 spark = SparkSession.builder \
@@ -15,74 +14,77 @@ spark = SparkSession.builder \
     .config("spark.hadoop.fs.defaultFS", "hdfs://hadoop-namenode:9000") \
     .getOrCreate()
 
-# Đường dẫn cục bộ đến thư mục chứa ảnh
-local_dir = "/home/fit/square_pick-2/all_images"
-# Thư mục đích trên HDFS
-hdfs_dir = "/user/fit/all_images"
+# Thư mục tạm cục bộ để lưu ảnh
+temp_local_dir = "/tmp/processed_images"
+# Thư mục nguồn trên HDFS
+hdfs_source_dir = "/user/fit/all_images"
 # Thư mục đích cho ảnh đã xử lý trên HDFS
 hdfs_processed_dir = "/user/fit/processed_all_images"
 
-# Hàm để ghi từng file hoặc thư mục lên HDFS (chạy trên driver)
-def save_to_hdfs(local_path, hdfs_path):
-    if os.path.isdir(local_path):
-        # Nếu là thư mục, tạo thư mục trên HDFS và tải các tệp bên trong
-        dir_name = os.path.basename(local_path)
-        hdfs_dir_path = f"{hdfs_path.rstrip('/')}/{dir_name}"
-        spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration()).mkdirs(spark._jvm.org.apache.hadoop.fs.Path(hdfs_dir_path))
-        print(f"Successfully created directory {hdfs_dir_path} on HDFS")
-        # Lặp qua các tệp và thư mục con bên trong để tải lên
-        for item in os.listdir(local_path):
-            item_path = os.path.join(local_path, item)
-            save_to_hdfs(item_path, hdfs_dir_path)
-    else:
-        # Nếu là tệp, tải tệp lên HDFS
-        file_name = os.path.basename(local_path)
-        hdfs_file_path = f"{hdfs_path.rstrip('/')}/{file_name}"
-        hdfs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
-        hdfs_path = spark._jvm.org.apache.hadoop.fs.Path(hdfs_file_path)
-        with open(local_path, "rb") as f:
-            output_stream = hdfs.create(hdfs_path, True)
-            output_stream.write(f.read())
-            output_stream.close()
-        print(f"Successfully uploaded {file_name} to HDFS")
+# Tạo thư mục tạm nếu chưa tồn tại
+os.makedirs(temp_local_dir, exist_ok=True)
 
-# Hàm để thay đổi kích thước ảnh
-def resize_image(local_path, output_size=(256, 256)):
+# Hàm tải file từ HDFS về cục bộ
+def download_from_hdfs(hdfs_path, local_path):
+    hdfs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+    hdfs_file_path = spark._jvm.org.apache.hadoop.fs.Path(hdfs_path)
+    if hdfs.exists(hdfs_file_path):
+        input_stream = hdfs.open(hdfs_file_path)
+        with open(local_path, "wb") as f:
+            f.write(bytearray(input_stream.read()))
+        input_stream.close()
+        print(f"Downloaded {hdfs_path} to {local_path}")
+
+# Hàm upload file lên HDFS
+def upload_to_hdfs(local_path, hdfs_path):
+    hdfs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+    hdfs_file_path = spark._jvm.org.apache.hadoop.fs.Path(hdfs_path)
+    with open(local_path, "rb") as f:
+        output_stream = hdfs.create(hdfs_file_path, True)
+        output_stream.write(f.read())
+        output_stream.close()
+    print(f"Uploaded {local_path} to {hdfs_path}")
+
+# Hàm thay đổi kích thước ảnh
+def resize_image(input_path, output_path, output_size=(256, 256)):
     try:
-        # Mở ảnh từ đường dẫn cục bộ bằng Pillow
-        with open(local_path, "rb") as f:
+        with open(input_path, "rb") as f:
             img = Image.open(io.BytesIO(f.read()))
             img_resized = img.resize(output_size)
-            # Tạo buffer để lưu ảnh dưới dạng nhị phân
-            buffer = io.BytesIO()
-            img_resized.save(buffer, format=img.format)
-            return buffer.getvalue()
+            img_resized.save(output_path, format=img.format)
+            print(f"Resized image saved to {output_path}")
     except UnidentifiedImageError as e:
-        print(f"Failed to identify image {local_path} for resizing. Error: {e}")
-        return None
+        print(f"Failed to identify image {input_path} for resizing. Error: {e}")
 
-# Gọi hàm để tải toàn bộ thư mục và các tệp lên HDFS
-save_to_hdfs(local_dir, hdfs_dir)
+# Duyệt qua tất cả file trong thư mục nguồn trên HDFS
+hdfs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+source_path = spark._jvm.org.apache.hadoop.fs.Path(hdfs_source_dir)
+if hdfs.exists(source_path):
+    files_status = hdfs.listStatus(source_path)
+    for file_status in files_status:
+        file_path = file_status.getPath().toString()
+        file_name = os.path.basename(file_path)
+        local_file_path = os.path.join(temp_local_dir, file_name)
+        resized_file_path = os.path.join(temp_local_dir, f"resized_{file_name}")
+        
+        # Tải ảnh từ HDFS về thư mục tạm
+        download_from_hdfs(file_path, local_file_path)
+        
+        # Resize ảnh và lưu vào thư mục tạm
+        resize_image(local_file_path, resized_file_path)
+        
+        # Tải ảnh đã resize lên HDFS
+        hdfs_resized_path = f"{hdfs_processed_dir}/{file_name}"
+        upload_to_hdfs(resized_file_path, hdfs_resized_path)
+        
+        # Xóa file resized khỏi thư mục tạm
+        os.remove(local_file_path)
+        os.remove(resized_file_path)
+        print(f"Cleaned up temporary files for {file_name}")
 
-# Lặp qua từng tệp trong thư mục nguồn để thay đổi kích thước và tải lên thư mục đích
-for root, _, files in os.walk(local_dir):
-    for file in files:
-        local_file_path = os.path.join(root, file)
-        if not local_file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
-            print(f"Skipping non-image file: {local_file_path}")
-            continue
-        # Thay đổi kích thước ảnh
-        resized_content = resize_image(local_file_path)
-        if resized_content:
-            # Tạo đường dẫn HDFS cho ảnh đã thay đổi kích thước
-            relative_path = os.path.relpath(local_file_path, local_dir)
-            hdfs_resized_path = f"{hdfs_processed_dir}/{relative_path}"
-            # Tải ảnh đã thay đổi kích thước lên HDFS
-            hdfs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
-            hdfs_path = spark._jvm.org.apache.hadoop.fs.Path(hdfs_resized_path)
-            with hdfs.create(hdfs_path, True) as output_stream:
-                output_stream.write(resized_content)
-            print(f"Successfully uploaded resized image {hdfs_resized_path} to HDFS")
+# Xóa thư mục tạm sau khi hoàn thành
+shutil.rmtree(temp_local_dir)
+print("Cleaned up temporary directory.")
 
 # Dừng SparkSession
 spark.stop()
