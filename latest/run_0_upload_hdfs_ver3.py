@@ -62,6 +62,9 @@ def upload_images_to_hdfs(spark, local_dir, hdfs_dir):
         for file_name in files:
             if file_name.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff")):
 
+                # Thay thế khoảng trắng trong tên file thành dấu gạch dưới
+                file_name = file_name.replace(" ", "_")
+                
                 local_file_path = os.path.join(root, file_name)
                 
                 # Tính đường dẫn tương đối để bảo toàn cấu trúc thư mục
@@ -84,6 +87,7 @@ def upload_images_to_hdfs(spark, local_dir, hdfs_dir):
                     log_message(f"Đã tải lên thành công {local_file_path} vào {hdfs_file_path}")
                 except Exception as e:
                     log_message(f"Lỗi khi tải lên {local_file_path} vào {hdfs_file_path}: {e}")
+
 
 def main():
     """Chương trình chính để tải lên ảnh từ thư mục cục bộ lên HDFS."""

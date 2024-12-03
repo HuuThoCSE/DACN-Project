@@ -41,25 +41,17 @@ def init_spark():
     spark = SparkSession.builder \
         .appName("Process Images from HDFS with Advanced Segmentation") \
         .master("yarn") \
+        .config("spark.driver.host", "master") \
+        .config("spark.driver.bindAddress", "0.0.0.0") \
         .config("spark.hadoop.fs.defaultFS", "hdfs://node1:9000") \
         .getOrCreate()
+    log_message("SparkSession đã được khởi tạo.")
     return spark
+
 
 # =========================
 # Các chức năng thao tác với HDFS
 # =========================
-
-def delete_directory_from_hdfs(spark, hdfs_dir):
-    """Xóa thư mục trên HDFS nếu tồn tại."""
-    fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
-    hdfs_path = spark._jvm.org.apache.hadoop.fs.Path(hdfs_dir)
-
-    if fs.exists(hdfs_path):
-        fs.delete(hdfs_path, True)  # True để xóa đệ quy các tệp và thư mục con
-        log_message(f"Đã xóa thư mục HDFS: {hdfs_dir}")
-    else:
-        log_message(f"Thư mục HDFS không tồn tại: {hdfs_dir}")
-
 
 def list_files_in_hdfs(spark, hdfs_dir):
     """Liệt kê tất cả các tệp trong thư mục HDFS (bao gồm cả thư mục con)."""
@@ -77,21 +69,6 @@ def list_files_in_hdfs(spark, hdfs_dir):
 
     traverse(hdfs_path)
     return files
-
-
-def download_image_from_hdfs(spark, hdfs_file_path, local_file_path):
-    """Tải một ảnh từ HDFS về đường dẫn cục bộ."""
-    fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
-    hdfs_path = spark._jvm.org.apache.hadoop.fs.Path(hdfs_file_path)
-    local_path = spark._jvm.org.apache.hadoop.fs.Path(local_file_path)
-
-    try:
-        fs.copyToLocalFile(False, hdfs_path, local_path)
-        log_message(f"Đã tải xuống {hdfs_file_path} vào {local_file_path}")
-        return True
-    except Exception as e:
-        log_message(f"Lỗi khi tải xuống {hdfs_file_path} vào {local_file_path}: {e}")
-        return False
 
 
 def upload_image_to_hdfs(spark, local_file_path, hdfs_file_path):
@@ -206,15 +183,16 @@ def process_image(image_path):
     - Phân đoạn K-Means
     - Chọn cluster tốt nhất
     - Post-processing
+    - Trả về segmented image, selected cluster, và ground truth mask
     """
     if not os.path.exists(image_path):
         log_message(f"Không tìm thấy tệp: {image_path}")
-        return None, None, None
+        return None, None, None, None
 
     image = cv2.imread(image_path)
     if image is None:
         log_message(f"Lỗi đọc {image_path}: Tệp có thể bị hỏng hoặc không phải là ảnh.")
-        return None, None, None
+        return None, None, None, None
 
     try:
         # Tiền xử lý
@@ -232,20 +210,20 @@ def process_image(image_path):
         # Post-processing
         ground_truth_mask = postprocess_segmented_image(selected_cluster)
 
-        # Return the processed images
-        return segmented_image, selected_cluster, ground_truth_mask
+        # Trả về các ảnh đã xử lý
+        return image, segmented_image, selected_cluster, ground_truth_mask
 
     except Exception as e:
         log_message(f"Exception khi xử lý {image_path}: {e}")
-        return None, None, None
+        return None, None, None, None
 
 
 # =========================
-# Hàm xử lý chính
+# Hàm xử lý chính với Spark RDD
 # =========================
 
 def main():
-    """Chương trình chính để xử lý ảnh từ HDFS và tải ảnh đã xử lý lên lại."""
+    """Chương trình chính để xử lý ảnh từ HDFS và tải ảnh đã xử lý lên lại sử dụng Spark RDD."""
     if len(sys.argv) < 3:
         log_message("Cách sử dụng: spark-submit script.py <input_hdfs_dir> <output_hdfs_dir>")
         sys.exit(1)
@@ -253,11 +231,11 @@ def main():
     input_hdfs_dir = sys.argv[1]
     output_hdfs_dir = sys.argv[2]
 
-    # Thư mục tạm thời để lưu ảnh tải xuống và xử lý
+    # Thư mục tạm thời để lưu ảnh tải xuống và xử lý trên mỗi node
     temp_download_dir = "/tmp/temp_download"
     temp_upload_dir = "/tmp/temp_upload"
 
-    # Tạo thư mục tạm nếu chưa tồn tại
+    # Tạo thư mục tạm nếu chưa tồn tại (trên driver node)
     for temp_dir in [temp_download_dir, temp_upload_dir]:
         if not os.path.exists(temp_dir):
             os.makedirs(temp_dir)
@@ -265,137 +243,153 @@ def main():
 
     # Khởi tạo Spark
     spark = init_spark()
+    sc = spark.sparkContext
 
     # Lấy danh sách tất cả các tệp ảnh trong thư mục HDFS đầu vào
     hdfs_files = list_files_in_hdfs(spark, input_hdfs_dir)
     log_message(f"Tìm thấy {len(hdfs_files)} tệp ảnh trong HDFS: {input_hdfs_dir}")
 
-    # Xử lý từng ảnh một
-    for hdfs_file in hdfs_files:
-        if not hdfs_file.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff")):
-            log_message(f"Bỏ qua tệp không phải ảnh: {hdfs_file}")
-            continue
+    if not hdfs_files:
+        log_message("Không có tệp ảnh nào để xử lý.")
+        spark.stop()
+        sys.exit(0)
 
-        # Tính đường dẫn tương đối để bảo toàn cấu trúc thư mục
-        relative_path = os.path.relpath(hdfs_file, input_hdfs_dir)
-        category_dir = os.path.dirname(relative_path)  # Thư mục con (e.g., benign)
-        base_name = os.path.basename(relative_path)
-        name, ext = os.path.splitext(base_name)
+    # Tạo RDD từ danh sách tệp ảnh
+    files_rdd = sc.parallelize(hdfs_files)
 
-        # Đường dẫn HDFS cho thư mục con
-        hdfs_output_category_dir = os.path.join(output_hdfs_dir, category_dir).replace("\\", "/")
+    # Phân vùng RDD (tùy chọn, có thể điều chỉnh số partition tùy theo cluster)
+    num_partitions = sc.defaultParallelism
+    files_rdd = files_rdd.repartition(num_partitions)
 
-        # Đường dẫn cục bộ cho các tệp ảnh
-        local_file_path = os.path.join(temp_download_dir, base_name)
-        original_processed_local_file_path = os.path.join(temp_upload_dir, f"{name}_original{ext}")
-        segmented_local_file_path = os.path.join(temp_upload_dir, f"{name}_segmented_kmeans{ext}")
-        selected_cluster_local_file_path = os.path.join(temp_upload_dir, f"{name}_selected_cluster{ext}")
-        ground_truth_mask_local_file_path = os.path.join(temp_upload_dir, f"{name}_ground_truth_mask{ext}")
-
-        # Tải ảnh từ HDFS về thư mục tạm
-        download_success = download_image_from_hdfs(spark, hdfs_file, local_file_path)
-        if not download_success:
-            log_message(f"Không thể tải xuống tệp: {hdfs_file}")
-            continue
-
-        # Sao chép ảnh gốc vào thư mục upload với hậu tố _original
+    def process_and_upload(hdfs_file):
+        """
+        Hàm xử lý và upload ảnh. Được gọi trên từng executor.
+        Trả về None hoặc thông báo lỗi.
+        """
         try:
-            shutil.copy(local_file_path, original_processed_local_file_path)
-            log_message(f"Đã sao chép ảnh gốc: {original_processed_local_file_path}")
-        except Exception as e:
-            log_message(f"Lỗi khi sao chép ảnh gốc: {e}")
-            continue
+            # Khởi tạo thư mục tạm trên executor nếu chưa tồn tại
+            local_download_dir = "/tmp/temp_download_executor"
+            local_upload_dir = "/tmp/temp_upload_executor"
 
-        # Upload ảnh gốc lên HDFS
-        upload_success = upload_image_to_hdfs(
-            spark,
-            original_processed_local_file_path,
-            os.path.join(hdfs_output_category_dir, f"{name}_original{ext}").replace("\\", "/")
-        )
-        if not upload_success:
-            log_message(f"Không thể tải lên ảnh gốc: {hdfs_output_category_dir}/{name}_original{ext}")
-            # Không dừng quá trình, tiếp tục với các ảnh khác
+            for dir_path in [local_download_dir, local_upload_dir]:
+                if not os.path.exists(dir_path):
+                    os.makedirs(dir_path)
 
-        # Xử lý ảnh
-        segmented_image, selected_cluster, ground_truth_mask = process_image(local_file_path)
-        if segmented_image is not None and selected_cluster is not None and ground_truth_mask is not None:
-            # Lưu ảnh Segmented Image (K-Means)
+            base_name = os.path.basename(hdfs_file)
+            name, ext = os.path.splitext(base_name)
+
+            # Đường dẫn cục bộ cho các tệp ảnh
+            local_file_path = os.path.join(local_download_dir, base_name)
+            original_processed_local_file_path = os.path.join(local_upload_dir, f"{name}_original{ext}")
+            segmented_local_file_path = os.path.join(local_upload_dir, f"{name}_segmented_kmeans{ext}")
+            selected_cluster_local_file_path = os.path.join(local_upload_dir, f"{name}_selected_cluster{ext}")
+            ground_truth_mask_local_file_path = os.path.join(local_upload_dir, f"{name}_ground_truth_mask{ext}")
+
+            # Tải ảnh từ HDFS về thư mục tạm
+            download_success = download_image_from_hdfs(spark, hdfs_file, local_file_path)
+            if not download_success:
+                return f"Lỗi tải xuống tệp: {hdfs_file}"
+
+            # Sao chép ảnh gốc vào thư mục upload với hậu tố _original
             try:
-                cv2.imwrite(segmented_local_file_path, segmented_image)
-                log_message(f"Đã xử lý và lưu ảnh Segmented K-Means: {segmented_local_file_path}")
+                shutil.copy(local_file_path, original_processed_local_file_path)
+                log_message(f"Đã sao chép ảnh gốc: {original_processed_local_file_path}")
             except Exception as e:
-                log_message(f"Lỗi khi lưu ảnh Segmented K-Means: {e}")
+                log_message(f"Lỗi khi sao chép ảnh gốc: {e}")
+                return f"Lỗi sao chép ảnh gốc: {hdfs_file}"
 
-            # Lưu ảnh Selected Cluster
-            try:
-                cv2.imwrite(selected_cluster_local_file_path, selected_cluster)
-                log_message(f"Đã xử lý và lưu ảnh Selected Cluster: {selected_cluster_local_file_path}")
-            except Exception as e:
-                log_message(f"Lỗi khi lưu ảnh Selected Cluster: {e}")
-
-            # Lưu ảnh Ground Truth Mask
-            try:
-                cv2.imwrite(ground_truth_mask_local_file_path, ground_truth_mask)
-                log_message(f"Đã xử lý và lưu ảnh Ground Truth Mask: {ground_truth_mask_local_file_path}")
-            except Exception as e:
-                log_message(f"Lỗi khi lưu ảnh Ground Truth Mask: {e}")
-
-            # Upload ảnh Segmented K-Means lên HDFS
+            # Upload ảnh gốc lên HDFS
+            hdfs_output_category_dir = os.path.join(output_hdfs_dir, os.path.dirname(os.path.relpath(hdfs_file, input_hdfs_dir))).replace("\\", "/")
             upload_success = upload_image_to_hdfs(
                 spark,
-                segmented_local_file_path,
-                os.path.join(hdfs_output_category_dir, f"{name}_segmented_kmeans{ext}").replace("\\", "/")
+                original_processed_local_file_path,
+                os.path.join(hdfs_output_category_dir, f"{name}_original{ext}").replace("\\", "/")
             )
             if not upload_success:
-                log_message(f"Không thể tải lên ảnh Segmented K-Means: {hdfs_output_category_dir}/{name}_segmented_kmeans{ext}")
+                log_message(f"Không thể tải lên ảnh gốc: {hdfs_output_category_dir}/{name}_original{ext}")
+                # Không dừng quá trình, tiếp tục với các ảnh khác
 
-            # Upload ảnh Selected Cluster lên HDFS
-            upload_success = upload_image_to_hdfs(
-                spark,
-                selected_cluster_local_file_path,
-                os.path.join(hdfs_output_category_dir, f"{name}_selected_cluster{ext}").replace("\\", "/")
-            )
-            if not upload_success:
-                log_message(f"Không thể tải lên ảnh Selected Cluster: {hdfs_output_category_dir}/{name}_selected_cluster{ext}")
+            # Xử lý ảnh
+            original_image, segmented_image, selected_cluster, ground_truth_mask = process_image(local_file_path)
+            if original_image is not None and segmented_image is not None and selected_cluster is not None and ground_truth_mask is not None:
+                # Lưu ảnh Segmented Image (K-Means)
+                try:
+                    cv2.imwrite(segmented_local_file_path, segmented_image)
+                    log_message(f"Đã xử lý và lưu ảnh Segmented K-Means: {segmented_local_file_path}")
+                except Exception as e:
+                    log_message(f"Lỗi khi lưu ảnh Segmented K-Means: {e}")
+                    return f"Lỗi lưu Segmented K-Means: {hdfs_file}"
 
-            # Upload ảnh Ground Truth Mask lên HDFS
-            upload_success = upload_image_to_hdfs(
-                spark,
-                ground_truth_mask_local_file_path,
-                os.path.join(hdfs_output_category_dir, f"{name}_ground_truth_mask{ext}").replace("\\", "/")
-            )
-            if not upload_success:
-                log_message(f"Không thể tải lên ảnh Ground Truth Mask: {hdfs_output_category_dir}/{name}_ground_truth_mask{ext}")
-        else:
-            log_message(f"Không thể xử lý tệp: {local_file_path}")
+                # Lưu ảnh Selected Cluster
+                try:
+                    cv2.imwrite(selected_cluster_local_file_path, selected_cluster)
+                    log_message(f"Đã xử lý và lưu ảnh Selected Cluster: {selected_cluster_local_file_path}")
+                except Exception as e:
+                    log_message(f"Lỗi khi lưu ảnh Selected Cluster: {e}")
+                    return f"Lỗi lưu Selected Cluster: {hdfs_file}"
 
-        # Xóa tệp ảnh tạm cục bộ sau khi xử lý
-        try:
-            if os.path.exists(local_file_path):
-                os.remove(local_file_path)
-                log_message(f"Đã xóa tệp tạm: {local_file_path}")
-            if os.path.exists(original_processed_local_file_path):
-                os.remove(original_processed_local_file_path)
-                log_message(f"Đã xóa tệp tạm đã xử lý: {original_processed_local_file_path}")
-            if os.path.exists(segmented_local_file_path):
-                os.remove(segmented_local_file_path)
-                log_message(f"Đã xóa tệp tạm đã xử lý: {segmented_local_file_path}")
-            if os.path.exists(selected_cluster_local_file_path):
-                os.remove(selected_cluster_local_file_path)
-                log_message(f"Đã xóa tệp tạm đã xử lý: {selected_cluster_local_file_path}")
-            if os.path.exists(ground_truth_mask_local_file_path):
-                os.remove(ground_truth_mask_local_file_path)
-                log_message(f"Đã xóa tệp tạm đã xử lý: {ground_truth_mask_local_file_path}")
+                # Lưu ảnh Ground Truth Mask
+                try:
+                    cv2.imwrite(ground_truth_mask_local_file_path, ground_truth_mask)
+                    log_message(f"Đã xử lý và lưu ảnh Ground Truth Mask: {ground_truth_mask_local_file_path}")
+                except Exception as e:
+                    log_message(f"Lỗi khi lưu ảnh Ground Truth Mask: {e}")
+                    return f"Lỗi lưu Ground Truth Mask: {hdfs_file}"
+
+                # Upload ảnh Segmented K-Means lên HDFS
+                upload_success = upload_image_to_hdfs(
+                    spark,
+                    segmented_local_file_path,
+                    os.path.join(hdfs_output_category_dir, f"{name}_segmented_kmeans{ext}").replace("\\", "/")
+                )
+                if not upload_success:
+                    log_message(f"Không thể tải lên ảnh Segmented K-Means: {hdfs_output_category_dir}/{name}_segmented_kmeans{ext}")
+
+                # Upload ảnh Selected Cluster lên HDFS
+                upload_success = upload_image_to_hdfs(
+                    spark,
+                    selected_cluster_local_file_path,
+                    os.path.join(hdfs_output_category_dir, f"{name}_selected_cluster{ext}").replace("\\", "/")
+                )
+                if not upload_success:
+                    log_message(f"Không thể tải lên ảnh Selected Cluster: {hdfs_output_category_dir}/{name}_selected_cluster{ext}")
+
+                # Upload ảnh Ground Truth Mask lên HDFS
+                upload_success = upload_image_to_hdfs(
+                    spark,
+                    ground_truth_mask_local_file_path,
+                    os.path.join(hdfs_output_category_dir, f"{name}_ground_truth_mask{ext}").replace("\\", "/")
+                )
+                if not upload_success:
+                    log_message(f"Không thể tải lên ảnh Ground Truth Mask: {hdfs_output_category_dir}/{name}_ground_truth_mask{ext}")
+            else:
+                log_message(f"Không thể xử lý tệp: {local_file_path}")
+                return f"Lỗi xử lý ảnh: {hdfs_file}"
+
+            # Xóa tệp ảnh tạm cục bộ sau khi xử lý
+            try:
+                for path in [local_file_path, original_processed_local_file_path,
+                             segmented_local_file_path, selected_cluster_local_file_path,
+                             ground_truth_mask_local_file_path]:
+                    if os.path.exists(path):
+                        os.remove(path)
+                        log_message(f"Đã xóa tệp tạm: {path}")
+            except Exception as e:
+                log_message(f"Lỗi khi xóa tệp tạm: {e}")
+                return f"Lỗi xóa tệp tạm: {hdfs_file}"
+
+            return f"Đã xử lý thành công tệp: {hdfs_file}"
+
         except Exception as e:
-            log_message(f"Lỗi khi xóa tệp tạm: {e}")
+            log_message(f"Exception khi xử lý {hdfs_file}: {e}")
+            return f"Exception khi xử lý {hdfs_file}: {e}"
 
-    # Xóa thư mục tạm nếu cần (tùy chọn)
-    for temp_dir in [temp_download_dir, temp_upload_dir]:
-        try:
-            shutil.rmtree(temp_dir)
-            log_message(f"Đã xóa thư mục tạm: {temp_dir}")
-        except Exception as e:
-            log_message(f"Lỗi khi xóa thư mục tạm {temp_dir}: {e}")
+    # Áp dụng hàm xử lý và upload lên RDD
+    results = files_rdd.map(process_and_upload).collect()
+
+    # Log kết quả
+    for res in results:
+        log_message(res)
 
     # Dừng SparkSession
     spark.stop()
