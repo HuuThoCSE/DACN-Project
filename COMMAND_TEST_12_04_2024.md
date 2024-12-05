@@ -127,7 +127,7 @@ spark-submit \
     /user/ubuntu/dacn/processed_dataset7
 ```
 
-## Đợi test
+## Đợi test - Phải dùng số nguyên, không dùng số thực khi khai báo cấu hình
 ```
 spark-submit \
     --master spark://master:7077 \
@@ -148,7 +148,7 @@ spark-submit \
     /user/ubuntu/dacn/processed_dataset8
 ```
 
-# Thử tăng bộ nhớ - thêm bộ nhớ overhead để quản lý executor
+# Thử tăng bộ nhớ - thêm bộ nhớ overhead để quản lý executor - Ok chạy - 
 ````
 spark-submit \
     --master spark://master:7077 \
