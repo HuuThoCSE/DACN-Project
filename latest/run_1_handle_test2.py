@@ -41,8 +41,6 @@ def init_spark():
     spark = SparkSession.builder \
         .appName("Process Images from HDFS with Advanced Segmentation") \
         .master("yarn") \
-        .config("spark.driver.host", "master") \
-        .config("spark.driver.bindAddress", "0.0.0.0") \
         .config("spark.hadoop.fs.defaultFS", "hdfs://node1:9000") \
         .getOrCreate()
     log_message("SparkSession đã được khởi tạo.")
@@ -217,6 +215,20 @@ def process_image(image_path):
         log_message(f"Exception khi xử lý {image_path}: {e}")
         return None, None, None, None
 
+def download_image_from_hdfs(spark, hdfs_file, local_file):
+    """Tải ảnh từ HDFS xuống thư mục cục bộ."""
+    fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+    hdfs_path = spark._jvm.org.apache.hadoop.fs.Path(hdfs_file)
+    local_path = os.path.join(local_file)
+
+    try:
+        # Tải ảnh từ HDFS về
+        fs.copyToLocalFile(False, hdfs_path, local_path)
+        log_message(f"Đã tải xuống {hdfs_file} thành công.")
+        return True
+    except Exception as e:
+        log_message(f"Lỗi tải xuống {hdfs_file}: {e}")
+        return False
 
 # =========================
 # Hàm xử lý chính với Spark RDD
@@ -262,6 +274,8 @@ def main():
     files_rdd = files_rdd.repartition(num_partitions)
 
     def process_and_upload(hdfs_file):
+        spark = SparkSession.builder.getOrCreate() 
+        
         """
         Hàm xử lý và upload ảnh. Được gọi trên từng executor.
         Trả về None hoặc thông báo lỗi.
@@ -270,10 +284,9 @@ def main():
             # Khởi tạo thư mục tạm trên executor nếu chưa tồn tại
             local_download_dir = "/tmp/temp_download_executor"
             local_upload_dir = "/tmp/temp_upload_executor"
-
-            for dir_path in [local_download_dir, local_upload_dir]:
-                if not os.path.exists(dir_path):
-                    os.makedirs(dir_path)
+            for dir_path in [local_download_dir, local_upload_dir]:  
+                if not os.path.exists(dir_path):  
+                    os.makedirs(dir_path)  
 
             base_name = os.path.basename(hdfs_file)
             name, ext = os.path.splitext(base_name)
