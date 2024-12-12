@@ -1,0 +1,9 @@
+{
+	"folders": [
+		{
+			"uri": "vscode-remote://ssh-remote+0.tcp.ap.ngrok.io/"
+		}
+	],
+	"remoteAuthority": "ssh-remote+0.tcp.ap.ngrok.io",
+	"settings": {}
+}
